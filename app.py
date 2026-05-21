@@ -125,14 +125,12 @@ def employee_dashboard():
 
     st.sidebar.success("Logged in as Admin")
 
-    # -------------------------------------------------
-    # DASHBOARD PAGE
-    # -------------------------------------------------
+    
     if menu == "Dashboard":
 
         st.markdown("<h1 class='title'>📊 HR Employee Dashboard</h1>", unsafe_allow_html=True)
 
-        # METRICS
+        
         m1, m2, m3 = st.columns(3)
 
         m1.metric("Total Employees", "120")
@@ -141,7 +139,7 @@ def employee_dashboard():
 
         st.divider()
 
-        # SAMPLE TABLE
+        
         data = {
             "Employee ID": [101, 102, 103],
             "Name": ["John", "Emma", "David"],
@@ -154,7 +152,7 @@ def employee_dashboard():
 
         st.dataframe(df, use_container_width=True)
 
-        # LINE CHART
+        
         chart_data = pd.DataFrame({
             "Months": ["Jan", "Feb", "Mar", "Apr", "May"],
             "Employees Joined": [5, 8, 6, 10, 7]
@@ -166,18 +164,14 @@ def employee_dashboard():
             chart_data.set_index("Months")
         )
 
-    # -------------------------------------------------
-    # EMPLOYEE REGISTRATION PAGE
-    # -------------------------------------------------
+    
     elif menu == "Employee Registration":
 
         st.markdown("<h1 class='title'>📝 Employee Registration Form</h1>", unsafe_allow_html=True)
 
         col1, col2 = st.columns([1,2])
 
-        # -------------------------------------------------
-        # LEFT SIDE - PROFILE IMAGE
-        # -------------------------------------------------
+       
         with col1:
 
             st.markdown("<div class='box'>", unsafe_allow_html=True)
