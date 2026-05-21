@@ -1,9 +1,11 @@
 import streamlit as st
 from PIL import Image
 import os
+
 import PyPDF2
 from docx import Document
 import pandas as pd
+
 
 st.set_page_config(
     page_title="Employee Dashboard",
