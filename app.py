@@ -1,18 +1,16 @@
 import streamlit as st
 from PIL import Image
 import os
-import cv2
-import numpy as np
-import pdfplumber
+import PyPDF2
 from docx import Document
 import pandas as pd
-import io
-
-# Pure Python library to read embedded images without needing Poppler
-from pypdf import PdfReader 
+import base64
+import sqlite3
+import re
+import time
 
 st.set_page_config(
-    page_title="Employee Dashboard",
+    page_title="AI HR Employee Management System",
     page_icon="💼",
     layout="wide"
 )
@@ -43,192 +41,553 @@ st.markdown("""
     font-size: 16px;
     font-weight: bold;
 }
+.viewer-box {
+    background-color: white;
+    padding: 25px;
+    border-radius: 15px;
+    box-shadow: 0px 2px 12px rgba(0,0,0,0.1);
+}
 </style>
 """, unsafe_allow_html=True)
 
-USERNAME = "admin"
-PASSWORD = "1234"
+# Database Connection
+conn = sqlite3.connect("employees.db", check_same_thread=False)
+cursor = conn.cursor()
 
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS employees(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    age INTEGER,
+    department TEXT,
+    email TEXT,
+    skills TEXT,
+    image TEXT,
+    resume TEXT
+)
+''')
+conn.commit()
+
+# =================================================
+# SECURE ADMINISTRATIVE CREDENTIALS
+# =================================================
+ADMIN_EMAIL = "admin@company.com"
+ADMIN_PASS = "admin1234"  
+
+HR_EMAIL = "hr@company.com"
+HR_PASS = "hr1234"        
+
+# Session State Initialization
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
+if "user_role" not in st.session_state:
+    st.session_state.user_role = None  
+if "employee_id" not in st.session_state:
+    st.session_state.employee_id = None  
+if "selected_profile" not in st.session_state:
+    st.session_state.selected_profile = None
+if "selected_resume" not in st.session_state:
+    st.session_state.selected_resume = None
+if "open_edit_page" not in st.session_state:
+    st.session_state.open_edit_page = False
+if "edit_employee_id" not in st.session_state:
+    st.session_state.edit_employee_id = None
 
 def login():
-    st.markdown("<h1 class='title'>💼 Employee Login Portal</h1>", unsafe_allow_html=True)
+    st.markdown("<h1 class='title'> Employee Login Portal </h1>", unsafe_allow_html=True)
+    
     col1, col2, col3 = st.columns([1,2,1])
     with col2:
         st.markdown("<div class='box'>", unsafe_allow_html=True)
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        if st.button("Login"):
-            if username == USERNAME and password == PASSWORD:
-                st.session_state.logged_in = True
-                st.success("Login Successful")
-                st.rerun()
+        
+        username = st.text_input("Username ")
+        email_input = st.text_input(" Email Address")
+        
+        # Smart UI Logic: Checks the email input dynamically as the user types
+        is_management = email_input.strip().lower() in [ADMIN_EMAIL.lower(), HR_EMAIL.lower()]
+        
+        if is_management:
+            # This password block pops up dynamically ONLY for Admin or HR emails
+            st.warning("🔒 Management Email Detected. Password Required.")
+            password_input = st.text_input("Enter Management Password", type="password")
+        else:
+            password_input = ""
+        
+        if st.button("Log In"):
+            if not username.strip() or not email_input.strip():
+                st.error("Please fill in both Username and Email fields to log in.")
+            
+            # 1. Secure Admin Check
+            elif email_input.strip().lower() == ADMIN_EMAIL.lower():
+                if password_input == ADMIN_PASS:
+                    st.session_state.logged_in = True
+                    st.session_state.user_role = "admin"
+                    st.success(f"Admin Login Successful. Welcome back, {username}!")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error("Access Denied: Incorrect password provided for Admin access.")
+                
+            # 2. Secure HR Check
+            elif email_input.strip().lower() == HR_EMAIL.lower():
+                if password_input == HR_PASS:
+                    st.session_state.logged_in = True
+                    st.session_state.user_role = "hr"
+                    st.success(f"HR Login Successful. Welcome back, {username}!")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error("Access Denied: Incorrect password provided for HR access.")
+                
+            # 3. Standard Worker Database Check
             else:
-                st.error("Invalid Username or Password")
+                cursor.execute("SELECT id, name FROM employees WHERE email=?", (email_input.strip(),))
+                user_match = cursor.fetchone()
+                
+                if user_match:
+                    st.session_state.logged_in = True
+                    st.session_state.user_role = "employee"
+                    st.session_state.employee_id = user_match[0]
+                    st.success(f"Employee Login Successful! Welcome back, {user_match[1]}.")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error("Access Denied. No matching Email address found in the database records.")
+                    
         st.markdown("</div>", unsafe_allow_html=True)
 
-# -------------------------------------------------
-# PURE PYTHON TEXT EXTRACTION (No Poppler Required)
-# -------------------------------------------------
-@st.cache_data
-def extract_pdf_text(uploaded_file):
-    try:
-        text = ""
-        file_bytes = uploaded_file.read()
+def logout():
+    st.session_state.logged_in = False
+    st.session_state.user_role = None
+    st.session_state.employee_id = None
+    st.session_state.open_edit_page = False
+    st.session_state.edit_employee_id = None
+    st.session_state.selected_profile = None
+    st.session_state.selected_resume = None
+    st.rerun()
+
+def extract_pdf_text(file):
+    pdf_reader = PyPDF2.PdfReader(file)
+    text = ""
+    for page in pdf_reader.pages:
+        extracted = page.extract_text()
+        if extracted:
+            text += extracted
+    return text
+
+def extract_docx_text(file):
+    doc = Document(file)
+    text = ""
+    for para in doc.paragraphs:
+        text += para.text + "\n"
+    return text
+
+def extract_skills(text):
+    skill_keywords = [
+        "Python", "Java", "SQL", "Machine Learning", "Data Science", 
+        "HTML", "CSS", "JavaScript", "React", "Streamlit", "C", "C++", 
+        "Power BI", "Excel"
+    ]
+    found_skills = []
+    for skill in skill_keywords:
+        if skill.lower() in text.lower():
+            found_skills.append(skill)
+    return found_skills
+
+def show_pdf(file_path):
+    with open(file_path, "rb") as f:
+        base64_pdf = base64.b64encode(f.read()).decode("utf-8")
+    pdf_display = f'<iframe src="data:application/pdf;base64,{base64_pdf}" width="100%" height="700" type="application/pdf"></iframe>'
+    st.markdown(pdf_display, unsafe_allow_html=True)
+
+def fetch_employees():
+    cursor.execute("SELECT * FROM employees")
+    return cursor.fetchall()
+
+def fetch_single_employee(emp_id):
+    cursor.execute("SELECT * FROM employees WHERE id=?", (emp_id,))
+    return cursor.fetchone()
+
+# =================================================
+# EDIT PROFILE VIEW
+# =================================================
+def render_edit_form(employee_id, return_to_role_view):
+    st.markdown("<h1 class='title'> Edit Profile Details</h1>", unsafe_allow_html=True)
+    selected_employee = fetch_single_employee(employee_id)
+    
+    if selected_employee:
+        full_name = selected_employee[1]
+        current_age = selected_employee[2]
+        current_department = selected_employee[3]
+        current_email = selected_employee[4]
+        current_skills = selected_employee[5]
+        current_image = selected_employee[6]
+        current_resume = selected_employee[7]
         
-        # Method 1: Try reading native digital text layout
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                extracted = page.extract_text()
-                if extracted:
-                    text += extracted + "\n"
-                    
-        # Method 2: If digital text extraction is empty, try raw image extraction fallback
-        if text.strip() == "":
-            with st.spinner("Scanned document detected. Extracting text records..."):
-                reader = PdfReader(io.BytesIO(file_bytes))
-                for page in reader.pages:
-                    # Look through embedded images on the scanned page
-                    for image_file_object in page.images:
-                        # Extract raw image bytes directly from the PDF object structure
-                        image_bytes = image_file_object.data
-                        text += f"[Extracted Image Attachment: {image_file_object.name}]\n"
-                        # Note: To fully read text INSIDE this image without Poppler, 
-                        # you can process image_bytes using lightweight cloud APIs or web models.
-                        
-        return text
-    except Exception as e:
-        return f"Error reading PDF: {e}"
-
-@st.cache_data
-def extract_docx_text(uploaded_file):
-    try:
-        doc = Document(uploaded_file)
-        text = ""
-        for para in doc.paragraphs:
-            text += para.text + "\n"
-        return text
-    except Exception as e:
-        return f"Error reading DOCX: {e}"
-
-# -------------------------------------------------
-# FACE VALIDATION
-# -------------------------------------------------
-def validate_face(image):
-    img_array = np.array(image.convert("RGB"))
-    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-    return len(faces) > 0
-
-# -------------------------------------------------
-# DASHBOARD
-# -------------------------------------------------
-def employee_dashboard():
-    st.sidebar.title("📌 Navigation")
-    menu = st.sidebar.radio("Select Option", ["Dashboard", "Employee Registration"])
-    st.sidebar.success("Logged in as Admin")
-
-    if menu == "Dashboard":
-        st.markdown("<h1 class='title'>📊 HR Employee Dashboard</h1>", unsafe_allow_html=True)
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Total Employees", "120")
-        m2.metric("Departments", "8")
-        m3.metric("Uploaded Resumes", "95")
-        st.divider()
-
-        data = {
-            "Employee ID": [101, 102, 103],
-            "Name": ["John", "Emma", "David"],
-            "Department": ["IT", "HR", "Finance"]
-        }
-        df = pd.DataFrame(data)
-        st.subheader("Employee Records")
-        st.dataframe(df, use_container_width=True)
-
-        chart_data = pd.DataFrame({
-            "Months": ["Jan", "Feb", "Mar", "Apr", "May"],
-            "Employees Joined": [5, 8, 6, 10, 7]
-        })
-        st.subheader("Employee Growth")
-        st.line_chart(chart_data.set_index("Months"))
-
-    elif menu == "Employee Registration":
-        st.markdown("<h1 class='title'>📝 Employee Registration Form</h1>", unsafe_allow_html=True)
+        name_parts = full_name.split()
+        first_name_value = name_parts[0] if len(name_parts) > 0 else ""
+        last_name_value = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+        
         col1, col2 = st.columns([1,2])
+        with col1:
+            st.subheader("Current Profile Image")
+            if current_image and os.path.exists(current_image):
+                st.image(current_image, width=250)
+            else:
+                st.info("No profile picture uploaded.")
+                
+            uploaded_new_image = st.file_uploader("Upload New Profile Picture", type=["jpg", "jpeg"])
+            
+        with col2:
+            new_first_name = st.text_input("First Name", value=first_name_value)
+            new_last_name = st.text_input("Last Name", value=last_name_value)
+            new_age = st.number_input("Age", min_value=18, max_value=60, value=int(current_age))
+            
+            department_options = ["IT", "HR", "Finance", "Marketing"]
+            if current_department not in department_options:
+                department_options.append(current_department)
+                
+            new_department = st.selectbox("Department", department_options, index=department_options.index(current_department))
+            new_email = st.text_input("Email", value=current_email)
+            
+            st.subheader("Skills Asset Track")
+            st.info(current_skills if current_skills else "No skills parsed yet.")
+            
+            uploaded_new_resume = st.file_uploader("Upload New Resume", type=["pdf", "docx"])
+            
+            updated_resume_path = current_resume
+            updated_image_path = current_image
+            updated_skills = current_skills
+            
+            if uploaded_new_resume is not None:
+                if uploaded_new_resume.type == "application/pdf":
+                    resume_text = extract_pdf_text(uploaded_new_resume)
+                else:
+                    resume_text = extract_docx_text(uploaded_new_resume)
+                detected_skills = extract_skills(resume_text)
+                updated_skills = ", ".join(detected_skills)
+                
+            if st.button("Save Changes"):
+                if not os.path.exists("profile_pics"):
+                    os.makedirs("profile_pics")
+                if not os.path.exists("resumes"):
+                    os.makedirs("resumes")
+                    
+                if uploaded_new_image is not None:
+                    updated_image_path = os.path.join("profile_pics", f"{employee_id}_{int(time.time())}_{uploaded_new_image.name}")
+                    with open(updated_image_path, "wb") as f:
+                        f.write(uploaded_new_image.getbuffer())
+                        
+                if uploaded_new_resume is not None:
+                    updated_resume_path = os.path.join("resumes", f"{employee_id}_{int(time.time())}_{uploaded_new_resume.name}")
+                    with open(updated_resume_path, "wb") as f:
+                        f.write(uploaded_new_resume.getbuffer())
+                        
+                updated_full_name = f"{new_first_name} {new_last_name}".strip()
+                
+                cursor.execute('''
+                    UPDATE employees 
+                    SET name=?, age=?, department=?, email=?, skills=?, image=?, resume=? 
+                    WHERE id=?
+                ''', (updated_full_name, new_age, new_department, new_email, updated_skills, updated_image_path, updated_resume_path, employee_id))
+                conn.commit()
+                
+                st.success("Information Updated Successfully!")
+                time.sleep(1)
+                
+                st.session_state.open_edit_page = False
+                if return_to_role_view in ["admin", "hr"]:
+                    st.session_state.page = "Employee Records"
+                    st.session_state.updated_successfully = True
+                st.rerun()
+                
+        if st.button("Cancel & Go Back"):
+            st.session_state.open_edit_page = False
+            st.rerun()
 
+# =================================================
+# EMPLOYEE SELF SERVICE DASHBOARD
+# =================================================
+def employee_self_service():
+    st.sidebar.title("Employee Portal")
+    st.sidebar.info(f"Connected as: EMPLOYEE")
+    if st.sidebar.button("Log Out"):
+        logout()
+        
+    emp_data = fetch_single_employee(st.session_state.employee_id)
+    if not emp_data:
+        st.error("Error fetching your record profile data.")
+        return
+          
+    st.markdown(f"<h1 class='title'>👋 Welcome, {emp_data[1]}</h1>", unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.markdown("<div class='box'>", unsafe_allow_html=True)
+        st.subheader("Profile Photo")
+        if emp_data[6] and os.path.exists(emp_data[6]):
+            st.image(emp_data[6], use_container_width=True)
+        else:
+            st.warning("No picture found.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        
+        if st.button("✏ Edit My Profile Info"):
+            st.session_state.edit_employee_id = emp_data[0]
+            st.session_state.open_edit_page = True
+            st.rerun()
+            
+    with col2:
+        st.markdown("<div class='box'>", unsafe_allow_html=True)
+        st.subheader("Personal Credentials & File Registries")
+        
+        details_df = pd.DataFrame({
+            "Metric File Profile": ["Employee ID System", "Full Structural Name", "Age Group", "Allocated Department", "E-Mail Address Connection"],
+            "Registered System Value": [emp_data[0], emp_data[1], emp_data[2], emp_data[3], emp_data[4]]
+        })
+        st.table(details_df.set_index("Metric File Profile"))
+        
+        st.markdown("### System Logged Core Skills")
+        if emp_data[5]:
+            skills_list = emp_data[5].split(", ")
+            for sk in skills_list:
+                st.success(sk)
+        else:
+            st.info("No system registered keywords recorded yet.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if emp_data[7] and os.path.exists(emp_data[7]):
+        with st.expander("📄 Click to View My Extracted Resume File Document on System"):
+            file_ext = emp_data[7].split(".")[-1]
+            if file_ext == "pdf":
+                show_pdf(emp_data[7])
+            else:
+                doc = Document(emp_data[7])
+                text = "\n".join([p.text for p in doc.paragraphs])
+                st.text_area("Parsed Text Structure", text, height=300)
+
+# =================================================
+# ADMINISTRATIVE / HR CONTROL DASHBOARD
+# =================================================
+def employee_dashboard():
+    st.sidebar.title("Navigation")
+    if "page" not in st.session_state:
+        st.session_state.page = "Dashboard"
+        
+    menu = st.sidebar.radio(
+        "Select Option",
+        ["Dashboard", "Employee Registration", "Employee Records"],
+        index=["Dashboard", "Employee Registration", "Employee Records"].index(st.session_state.page)
+    )
+    st.session_state.page = menu
+    st.sidebar.success(f"Logged in as {st.session_state.user_role.upper()}")
+    
+    if st.sidebar.button("Log Out"):
+        logout()
+        
+    if menu == "Dashboard":
+        st.markdown("<h1 class='title'>📊 AI HR Dashboard</h1>", unsafe_allow_html=True)
+        employees = fetch_employees()
+        total_employees = len(employees)
+        total_departments = len(set([emp[3] for emp in employees])) if employees else 0
+        total_resumes = len([emp for emp in employees if emp[7] != ""])
+        
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Employees", total_employees)
+        m2.metric("Departments", total_departments)
+        m3.metric("Uploaded Resumes", total_resumes)
+        st.divider()
+        
+        if employees:
+            df = pd.DataFrame(employees, columns=["ID", "Name", "Age", "Department", "Email", "Skills", "Image", "Resume"])
+            st.subheader("Department Wise Employee Count")
+            dept_count = df["Department"].value_counts()
+            st.bar_chart(dept_count)
+            
+            st.subheader("Employee Age Distribution")
+            age_df = df[["Name", "Age"]].set_index("Name")
+            st.line_chart(age_df)
+        else:
+            st.info("No employee data available")
+            
+    elif menu == "Employee Registration":
+        st.markdown("<h1 class='title'>📝 Employee Registration</h1>", unsafe_allow_html=True)
+        col1, col2 = st.columns([1,2])
+        
         with col1:
             st.markdown("<div class='box'>", unsafe_allow_html=True)
             st.subheader("Profile Picture")
-            uploaded_image = st.file_uploader("Upload JPG/PNG Image", type=["jpg", "jpeg", "png"])
+            uploaded_image = st.file_uploader("Upload JPG/JPEG Image", type=["jpg", "jpeg"])
+            image_path = ""
             if uploaded_image is not None:
-                file_size = uploaded_image.size / (1024 * 1024)
-                if file_size > 1:
-                    st.error("Image size should be below 1 MB")
-                else:
-                    image = Image.open(uploaded_image)
-                    if not validate_face(image):
-                        st.error("Invalid Photo: No face detected")
-                    else:
-                        st.image(image, caption="Profile Preview", width=250)
+                image = Image.open(uploaded_image)
+                st.image(image, caption="Profile Preview", width=250)
             st.markdown("</div>", unsafe_allow_html=True)
-
+            
         with col2:
             st.markdown("<div class='box'>", unsafe_allow_html=True)
             st.subheader("Employee Details")
             first_name = st.text_input("First Name")
             last_name = st.text_input("Last Name")
+            age = st.number_input("Age", min_value=18, max_value=60, step=1)
             department = st.selectbox("Department", ["IT", "HR", "Finance", "Marketing"])
             email = st.text_input("Email")
-
+            
+            email_pattern = r'^[\w\.-]+@[\w\.-]+\.\w+$'
             st.subheader("Resume Upload")
-            uploaded_resume = st.file_uploader("Upload Resume", type=["pdf", "docx"], accept_multiple_files=False)
+            uploaded_resume = st.file_uploader("Upload Resume", type=["pdf", "docx"])
             
             extracted_text = ""
+            resume_path = ""
+            detected_skills = []
             
             if uploaded_resume is not None:
                 if uploaded_resume.type == "application/pdf":
                     extracted_text = extract_pdf_text(uploaded_resume)
                 elif uploaded_resume.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
                     extracted_text = extract_docx_text(uploaded_resume)
+                    
+                st.text_area("Extracted Resume Text", extracted_text, height=250)
+                detected_skills = extract_skills(extracted_text)
                 
-                if extracted_text.strip() == "":
-                    st.warning("No text could be extracted from this file. The document appears to be fully unreadable.")
+                st.subheader("Detected Skills")
+                if detected_skills:
+                    for skill in detected_skills:
+                        st.success(skill)
                 else:
-                    st.text_area("Extracted Resume Text", extracted_text, height=250)
-                    st.download_button(label="⬇ Download Resume Text", data=extracted_text, file_name="resume_text.txt", mime="text/plain")
-
+                    st.warning("No matching skills found")
+                    
             if st.button("Register Employee"):
                 if first_name == "" or last_name == "" or email == "":
                     st.error("Please fill all required fields")
+                elif not re.match(email_pattern, email):
+                    st.error("Invalid Email Format")
                 else:
                     if not os.path.exists("profile_pics"):
                         os.makedirs("profile_pics")
                     if not os.path.exists("resumes"):
                         os.makedirs("resumes")
+                        
                     if uploaded_image is not None:
                         image_path = os.path.join("profile_pics", uploaded_image.name)
                         with open(image_path, "wb") as f:
                             f.write(uploaded_image.getbuffer())
+                            
                     if uploaded_resume is not None:
-                        uploaded_resume.seek(0)
                         resume_path = os.path.join("resumes", uploaded_resume.name)
                         with open(resume_path, "wb") as f:
                             f.write(uploaded_resume.getbuffer())
-                    
+                            
+                    full_name = f"{first_name} {last_name}"
+                    cursor.execute('''
+                        INSERT INTO employees (name, age, department, email, skills, image, resume)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (full_name, age, department, email, ", ".join(detected_skills), image_path, resume_path))
+                    conn.commit()
                     st.success("Employee Registered Successfully")
-                    st.write("### Employee Information")
-                    st.write("First Name:", first_name)
-                    st.write("Last Name:", last_name)
-                    st.write("Department:", department)
-                    st.write("Email:", email)
             st.markdown("</div>", unsafe_allow_html=True)
+            
+    elif menu == "Employee Records":
+        if "updated_successfully" in st.session_state and st.session_state.updated_successfully:
+            st.success("Employee details updated successfully")
+            st.session_state.updated_successfully = False
+            
+        st.markdown("<h1 class='title'> Employee Records</h1>", unsafe_allow_html=True)
+        employees = fetch_employees()
+        
+        if not employees:
+            st.warning("No employee records found")
+        else:
+            df = pd.DataFrame(employees, columns=["ID", "Name", "Age", "Department", "Email", "Skills", "Image", "Resume"])
+            search = st.text_input(" Search Employee By Name")
+            department_filter = st.selectbox("Filter By Department", ["All"] + list(df["Department"].unique()))
+            
+            filtered_df = df.copy()
+            if search:
+                filtered_df = filtered_df[filtered_df["Name"].str.contains(search, case=False)]
+            if department_filter != "All":
+                filtered_df = filtered_df[filtered_df["Department"] == department_filter]
+                
+            st.subheader("Employee Records Table")
+            h1, h2, h3, h4, h5, h6, h7, h8, h9 = st.columns([1,2,1,2,3,2,2,2,2])
+            h1.markdown(" ID")
+            h2.markdown("Name")
+            h3.markdown(" Age")
+            h4.markdown(" Dept")
+            h5.markdown("Email")
+            h6.markdown("Skills")
+            h7.markdown(" Profile")
+            h8.markdown("Resume")
+            h9.markdown(" Action")
+            st.divider()
+            
+            for i, row in filtered_df.iterrows():
+                col1, col2, col3, col4, col5, col6, col7, col8, col9 = st.columns([1,2,1,2,3,2,2,2,2])
+                col1.write(row["ID"])
+                col2.write(row["Name"])
+                col3.write(row["Age"])
+                col4.write(row["Department"])
+                col5.write(row["Email"])
+                col6.write(row["Skills"])
+                
+                with col7:
+                    if st.button("View", key=f"profile_{i}"):
+                        st.session_state.selected_profile = row["Image"]
+                        st.session_state.selected_resume = None
+                with col8:
+                    if st.button("View", key=f"resume_{i}"):
+                        st.session_state.selected_resume = row["Resume"]
+                        st.session_state.selected_profile = None
+                        
+                with col9:
+                    edit_col, delete_col = st.columns(2)
+                    with edit_col:
+                        if st.button("Edit", key=f"edit_{i}"):
+                            st.session_state.edit_employee_id = row["ID"]
+                            st.session_state.open_edit_page = True
+                            st.rerun()
+                    with delete_col:
+                        if st.button("Del", key=f"delete_{i}"):
+                            cursor.execute("DELETE FROM employees WHERE id=?", (row["ID"],))
+                            conn.commit()
+                            st.success("Deleted")
+                            st.rerun()
+                st.divider()
+                
+            if st.session_state.selected_profile:
+                st.markdown("##   Profile Picture")
+                if os.path.exists(st.session_state.selected_profile):
+                    st.image(st.session_state.selected_profile, width=400)
+                else:
+                    st.error("File not found on system local directory.")
+                if st.button("Close Profile View"):
+                    st.session_state.selected_profile = None
+                    st.rerun()
+                    
+            if st.session_state.selected_resume:
+                st.markdown("## 📄 Resume Viewer")
+                if os.path.exists(st.session_state.selected_resume):
+                    file_extension = st.session_state.selected_resume.split(".")[-1]
+                    if file_extension == "pdf":
+                        show_pdf(st.session_state.selected_resume)
+                    else:
+                        doc = Document(st.session_state.selected_resume)
+                        text = "\n".join([p.text for p in doc.paragraphs])
+                        st.text_area("Resume Content Text Block", text, height=500)
+                else:
+                    st.error("File missing from file paths.")  
+                if st.button("Close Resume View"):
+                    st.session_state.selected_resume = None
+                    st.rerun()
 
-# -------------------------------------------------
-# MAIN RUNNER
-# -------------------------------------------------
+# Main Application Runtime Router
 if st.session_state.logged_in:
-    employee_dashboard()
+    if st.session_state.open_edit_page:
+        render_edit_form(st.session_state.edit_employee_id, return_to_role_view=st.session_state.user_role)
+    else:
+        if st.session_state.user_role in ["admin", "hr"]:
+            employee_dashboard()
+        elif st.session_state.user_role == "employee":
+            employee_self_service()
 else:
     login()
+
